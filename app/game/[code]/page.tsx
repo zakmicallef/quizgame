@@ -166,17 +166,44 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
 
   // Submit answer (player)
   const handleSubmitAnswer = async () => {
-    if (!currentQuestion || !currentPlayer || !myAnswer.trim()) return;
+    if (!myAnswer.trim()) return;
     
+    if (!currentPlayer) {
+      setError("Player not found. Please refresh.");
+      return;
+    }
+    
+    if (!currentQuestion) {
+      // Try to fetch questions if we don't have the current question
+      console.log("No current question, attempting to fetch questions...");
+      const fetchedQuestions = await fetchQuestions(code);
+      if (fetchedQuestions.length > 0 && game?.current_question_number) {
+        const q = fetchedQuestions.find((q: Question) => q.question_number === game.current_question_number);
+        if (q) {
+          setCurrentQuestion(q);
+          // Continue with submission using the fetched question
+          await submitAnswerToServer(q.id, currentPlayer.id, myAnswer);
+          return;
+        }
+      }
+      setError("Question not loaded. Please wait a moment and try again.");
+      return;
+    }
+    
+    await submitAnswerToServer(currentQuestion.id, currentPlayer.id, myAnswer);
+  };
+  
+  // Helper to submit answer to server
+  const submitAnswerToServer = async (questionId: string, playerId: string, answer: string) => {
     setSubmittingAnswer(true);
     try {
       const res = await fetch("/api/game/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          questionId: currentQuestion.id,
-          playerId: currentPlayer.id,
-          answer: myAnswer,
+          questionId,
+          playerId,
+          answer,
         }),
       });
 
@@ -261,25 +288,39 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
 
   // Update current question when game state changes
   useEffect(() => {
-    if (game && questions.length > 0 && game.current_question_number > 0) {
-      const q = questions.find(q => q.question_number === game.current_question_number);
-      setCurrentQuestion(q || null);
+    async function updateCurrentQuestion() {
+      if (!game) return;
       
-      // Check if player already answered this question
-      if (q && currentPlayer && !currentPlayer.is_projector) {
-        // Reset submission state for new question
-        if (currentQuestion?.id !== q.id) {
-          setHasSubmitted(false);
-          setMyAnswer("");
+      // If game is playing but we don't have questions, fetch them
+      if (game.status === "playing" && game.phase === "asking" && questions.length === 0) {
+        console.log("Fetching questions because game is playing but questions are empty");
+        await fetchQuestions(code);
+        return; // Will re-run when questions are set
+      }
+      
+      if (questions.length > 0 && game.current_question_number > 0) {
+        const q = questions.find(q => q.question_number === game.current_question_number);
+        console.log("Setting current question:", q?.question_text);
+        setCurrentQuestion(q || null);
+        
+        // Check if player already answered this question
+        if (q && currentPlayer && !currentPlayer.is_projector) {
+          // Reset submission state for new question
+          if (currentQuestion?.id !== q.id) {
+            setHasSubmitted(false);
+            setMyAnswer("");
+          }
+        }
+        
+        // If showing answers, fetch them
+        if (game.phase === "showing_answers" && q) {
+          fetchAnswers(q.id);
         }
       }
-      
-      // If showing answers, fetch them
-      if (game.phase === "showing_answers" && q) {
-        fetchAnswers(q.id);
-      }
     }
-  }, [game?.current_question_number, game?.phase, questions, currentPlayer, currentQuestion?.id, fetchAnswers]);
+    
+    updateCurrentQuestion();
+  }, [game?.current_question_number, game?.phase, game?.status, questions, currentPlayer, currentQuestion?.id, fetchAnswers, code, fetchQuestions]);
 
   useEffect(() => {
     const playerId = localStorage.getItem("playerId");
@@ -452,7 +493,14 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
             .select("*")
             .eq("id", game.id)
             .single();
-          if (freshGame) setGame(freshGame);
+          if (freshGame) {
+            setGame(freshGame);
+            
+            // Fetch questions if game is playing and we don't have them
+            if (freshGame.status === "playing" && questions.length === 0) {
+              await fetchQuestions(code);
+            }
+          }
         }
       }
     }, 3000);
@@ -473,7 +521,7 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         supabase?.removeChannel(answersChannel);
       }
     };
-  }, [code, fetchPlayers, fetchQuestions, game?.id, game?.phase, currentQuestion, fetchAnswers]);
+  }, [code, fetchPlayers, fetchQuestions, game?.id, game?.phase, currentQuestion, fetchAnswers, questions.length]);
 
   if (loading) {
     return (

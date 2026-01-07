@@ -35,26 +35,41 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Question not found' }, { status: 404 })
     }
 
-    // Insert or update the answer (upsert)
-    const { data: savedAnswer, error: answerError } = await supabase
+    // Try to insert the answer first
+    const { data: insertedAnswer, error: insertError } = await supabase
       .from('answers')
-      .upsert(
-        {
-          question_id: questionId,
-          player_id: playerId,
-          answer_text: answer.trim(),
-        },
-        {
-          onConflict: 'question_id,player_id',
-        }
-      )
+      .insert({
+        question_id: questionId,
+        player_id: playerId,
+        answer_text: answer.trim(),
+      })
       .select()
       .single()
 
-    if (answerError) {
-      console.error('Failed to save answer:', answerError)
+    if (insertError) {
+      // If insert failed due to duplicate, try updating instead
+      if (insertError.code === '23505') { // Unique violation
+        const { data: updatedAnswer, error: updateError } = await supabase
+          .from('answers')
+          .update({ answer_text: answer.trim() })
+          .eq('question_id', questionId)
+          .eq('player_id', playerId)
+          .select()
+          .single()
+        
+        if (updateError) {
+          console.error('Failed to update answer:', updateError)
+          return NextResponse.json({ error: 'Failed to save answer' }, { status: 500 })
+        }
+        
+        return NextResponse.json({ answer: updatedAnswer })
+      }
+      
+      console.error('Failed to save answer:', insertError)
       return NextResponse.json({ error: 'Failed to save answer' }, { status: 500 })
     }
+
+    const savedAnswer = insertedAnswer
 
     return NextResponse.json({ answer: savedAnswer })
   } catch (err) {
