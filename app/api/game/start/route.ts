@@ -45,10 +45,14 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Game already started or finished' }, { status: 400 })
     }
 
-    // Update game status to 'playing'
+    // Update game status to 'playing' and set initial phase
     const { data: updatedGame, error: updateError } = await supabase
       .from('game_sessions')
-      .update({ status: 'playing' })
+      .update({ 
+        status: 'playing',
+        phase: 'asking',
+        current_question_number: 0  // Will be set to 1 when questions are generated
+      })
       .eq('id', game.id)
       .select()
       .single()
