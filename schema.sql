@@ -37,10 +37,20 @@ CREATE POLICY "Allow all on players" ON players FOR ALL USING (true) WITH CHECK 
 -- This is required for realtime to track all column changes
 ALTER TABLE players REPLICA IDENTITY FULL;
 
--- Add to realtime publication (run this, ignore if already exists)
+-- Enable realtime for game_sessions table (for game status updates)
+ALTER TABLE game_sessions REPLICA IDENTITY FULL;
+
+-- Add tables to realtime publication (run this, ignore if already exists)
 DO $$
 BEGIN
   ALTER PUBLICATION supabase_realtime ADD TABLE players;
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE game_sessions;
 EXCEPTION
   WHEN duplicate_object THEN NULL;
 END $$;

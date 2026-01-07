@@ -26,6 +26,7 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [startingGame, setStartingGame] = useState(false);
 
   // Fetch players from database
   const fetchPlayers = useCallback(async (gameId: string) => {
@@ -39,6 +40,37 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
     
     return playersData || [];
   }, []);
+
+  // Start the game (host only)
+  const handleStartGame = async () => {
+    if (!game || !currentPlayer?.is_projector) return;
+    
+    setStartingGame(true);
+    try {
+      const res = await fetch("/api/game/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gameCode: game.code,
+          playerId: currentPlayer.id,
+        }),
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok) {
+        setError(data.error || "Failed to start game");
+        return;
+      }
+
+      // Update local game state (realtime will also broadcast this)
+      setGame(data.game);
+    } catch {
+      setError("Network error. Try again.");
+    } finally {
+      setStartingGame(false);
+    }
+  };
 
   useEffect(() => {
     const playerId = localStorage.getItem("playerId");
@@ -55,7 +87,8 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
       return;
     }
 
-    let channel: RealtimeChannel | null = null;
+    let playersChannel: RealtimeChannel | null = null;
+    let gameChannel: RealtimeChannel | null = null;
     let mounted = true;
 
     async function loadGame() {
@@ -93,24 +126,23 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         }
       }
 
-      // Subscribe to ALL player changes for this game
-      channel = supabase!
+      // Subscribe to player changes for this game
+      playersChannel = supabase!
         .channel(`game-players-${gameData.id}`)
         .on(
           "postgres_changes",
           {
-            event: "*", // Listen to all events: INSERT, UPDATE, DELETE
+            event: "*",
             schema: "public",
             table: "players",
             filter: `game_id=eq.${gameData.id}`,
           },
           async (payload) => {
-            console.log("Realtime event:", payload.eventType, payload);
+            console.log("Player event:", payload.eventType, payload);
             
             if (payload.eventType === "INSERT") {
               const newPlayer = payload.new as Player;
               setPlayers((prev) => {
-                // Avoid duplicates
                 if (prev.some((p) => p.id === newPlayer.id)) return prev;
                 return [...prev, newPlayer];
               });
@@ -126,12 +158,33 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
           }
         )
         .subscribe((status, err) => {
-          console.log("Realtime subscription:", status, err);
+          console.log("Players subscription:", status, err);
           if (status === "SUBSCRIBED") {
             console.log("✓ Listening for player changes");
           }
-          if (status === "CHANNEL_ERROR") {
-            console.error("Realtime error:", err);
+        });
+
+      // Subscribe to game session changes (for status updates)
+      gameChannel = supabase!
+        .channel(`game-session-${gameData.id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "game_sessions",
+            filter: `id=eq.${gameData.id}`,
+          },
+          (payload) => {
+            console.log("Game event:", payload.eventType, payload);
+            const updatedGame = payload.new as GameSession;
+            setGame(updatedGame);
+          }
+        )
+        .subscribe((status, err) => {
+          console.log("Game subscription:", status, err);
+          if (status === "SUBSCRIBED") {
+            console.log("✓ Listening for game changes");
           }
         });
 
@@ -145,15 +198,29 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
       if (game?.id) {
         const freshPlayers = await fetchPlayers(game.id);
         setPlayers(freshPlayers);
+        
+        // Also refresh game status
+        if (supabase) {
+          const { data: freshGame } = await supabase
+            .from("game_sessions")
+            .select("*")
+            .eq("id", game.id)
+            .single();
+          if (freshGame) setGame(freshGame);
+        }
       }
     }, 3000);
 
     return () => {
       mounted = false;
       clearInterval(pollInterval);
-      if (channel) {
-        console.log("Cleaning up realtime channel");
-        supabase?.removeChannel(channel);
+      if (playersChannel) {
+        console.log("Cleaning up players channel");
+        supabase?.removeChannel(playersChannel);
+      }
+      if (gameChannel) {
+        console.log("Cleaning up game channel");
+        supabase?.removeChannel(gameChannel);
       }
     };
   }, [code, fetchPlayers, game?.id]);
@@ -274,10 +341,19 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
               <span className="text-violet-400">{regularPlayers.length}</span>
               <span className="text-zinc-600"> / 4 players</span>
             </p>
-            {regularPlayers.length >= 1 && (
-              <button className="mt-6 px-8 py-4 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white rounded-2xl font-bold text-xl transition-all transform hover:scale-105">
-                Start Game →
+            {regularPlayers.length >= 1 && game?.status === "waiting" && (
+              <button 
+                onClick={handleStartGame}
+                disabled={startingGame}
+                className="mt-6 px-8 py-4 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-2xl font-bold text-xl transition-all transform hover:scale-105"
+              >
+                {startingGame ? "Starting..." : "Start Game →"}
               </button>
+            )}
+            {game?.status === "playing" && (
+              <p className="mt-6 text-2xl font-bold text-emerald-400 animate-pulse">
+                🎮 Game in progress!
+              </p>
             )}
           </div>
 
@@ -337,10 +413,18 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         </div>
 
         {/* Status */}
-        <div className="flex items-center justify-center gap-3 text-zinc-400">
-          <div className="w-3 h-3 bg-emerald-500 rounded-full animate-pulse" />
-          <span>Waiting for host to start...</span>
-        </div>
+        {game?.status === "waiting" && (
+          <div className="flex items-center justify-center gap-3 text-zinc-400">
+            <div className="w-3 h-3 bg-emerald-500 rounded-full animate-pulse" />
+            <span>Waiting for host to start...</span>
+          </div>
+        )}
+        {game?.status === "playing" && (
+          <div className="flex items-center justify-center gap-3 text-emerald-400">
+            <div className="w-3 h-3 bg-emerald-400 rounded-full" />
+            <span className="font-bold text-lg">🎮 Game started! Get ready!</span>
+          </div>
+        )}
 
         {/* Other Players */}
         <div className="mt-12">
