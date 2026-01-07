@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, use } from "react";
+import { useEffect, useState, useCallback, use, useRef } from "react";
 import { supabase } from "@/lib/supabase";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
@@ -17,9 +17,12 @@ type GameSession = {
   id: string;
   code: string;
   status: "waiting" | "playing" | "finished";
-  phase: "lobby" | "asking" | "showing_answers" | "quiz";
+  phase: "lobby" | "asking" | "showing_answers" | "quiz" | "quiz_question" | "quiz_results" | "game_over";
   current_question_number: number;
   current_question_id: string | null;
+  current_quiz_question_id: string | null;
+  current_quiz_question_number: number;
+  question_deadline: string | null;
 };
 
 type Question = {
@@ -41,6 +44,44 @@ type Answer = {
   };
 };
 
+type QuizQuestion = {
+  id: string;
+  game_id: string;
+  about_player_id: string;
+  question_text: string;
+  correct_answer: string;
+  option_a: string;
+  option_b: string;
+  option_c: string;
+  option_d: string;
+  question_order: number;
+  players?: {
+    id: string;
+    name: string;
+    avatar_color: string;
+  };
+};
+
+type QuizAnswer = {
+  id: string;
+  quiz_question_id: string;
+  player_id: string;
+  selected_option: string;
+  is_correct: boolean;
+  players?: {
+    id: string;
+    name: string;
+    avatar_color: string;
+    is_projector: boolean;
+  };
+};
+
+type ScoreChange = {
+  playerId: string;
+  change: number;
+  reason: string;
+};
+
 export default function GamePage({ params }: { params: Promise<{ code: string }> }) {
   const { code } = use(params);
   const [game, setGame] = useState<GameSession | null>(null);
@@ -58,6 +99,17 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
   const [submittingAnswer, setSubmittingAnswer] = useState(false);
   const [hasSubmitted, setHasSubmitted] = useState(false);
   const [generatingQuestions, setGeneratingQuestions] = useState(false);
+  
+  // Quiz states
+  const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[]>([]);
+  const [currentQuizQuestion, setCurrentQuizQuestion] = useState<QuizQuestion | null>(null);
+  const [quizAnswers, setQuizAnswers] = useState<QuizAnswer[]>([]);
+  const [selectedOption, setSelectedOption] = useState<string | null>(null);
+  const [hasSubmittedQuiz, setHasSubmittedQuiz] = useState(false);
+  const [generatingQuiz, setGeneratingQuiz] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(20);
+  const [scoreChanges, setScoreChanges] = useState<ScoreChange[]>([]);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Fetch players from database
   const fetchPlayers = useCallback(async (gameId: string) => {
@@ -286,13 +338,189 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
     }
   };
 
+  // Fetch quiz questions
+  const fetchQuizQuestions = useCallback(async (gameCode: string) => {
+    try {
+      const res = await fetch(`/api/game/quiz/generate?gameCode=${gameCode}`);
+      const data = await res.json();
+      if (data.quizQuestions) {
+        setQuizQuestions(data.quizQuestions);
+        return data.quizQuestions;
+      }
+    } catch (err) {
+      console.error("Failed to fetch quiz questions:", err);
+    }
+    return [];
+  }, []);
+
+  // Fetch quiz answers for current question
+  const fetchQuizAnswers = useCallback(async (quizQuestionId: string) => {
+    try {
+      const res = await fetch(`/api/game/quiz/answer?quizQuestionId=${quizQuestionId}`);
+      const data = await res.json();
+      if (data.answers) {
+        setQuizAnswers(data.answers);
+      }
+    } catch (err) {
+      console.error("Failed to fetch quiz answers:", err);
+    }
+  }, []);
+
+  // Generate quiz questions (host only)
+  const handleStartQuiz = async () => {
+    if (!game || !currentPlayer?.is_projector) return;
+    
+    setGeneratingQuiz(true);
+    try {
+      const res = await fetch("/api/game/quiz/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gameCode: game.code,
+          playerId: currentPlayer.id,
+        }),
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok) {
+        setError(data.error || "Failed to generate quiz questions");
+        return;
+      }
+
+      setQuizQuestions(data.quizQuestions);
+      
+      // Refresh game state to get new phase
+      const { data: freshGame } = await supabase!
+        .from("game_sessions")
+        .select("*")
+        .eq("id", game.id)
+        .single();
+      if (freshGame) {
+        setGame(freshGame);
+      }
+    } catch {
+      setError("Network error. Try again.");
+    } finally {
+      setGeneratingQuiz(false);
+    }
+  };
+
+  // Submit quiz answer
+  const handleSubmitQuizAnswer = async (option: string) => {
+    if (!currentQuizQuestion || !currentPlayer || hasSubmittedQuiz) return;
+    
+    setSelectedOption(option);
+    setHasSubmittedQuiz(true);
+    
+    try {
+      const res = await fetch("/api/game/quiz/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          quizQuestionId: currentQuizQuestion.id,
+          playerId: currentPlayer.id,
+          selectedOption: option,
+        }),
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok && data.error !== "Already answered this question") {
+        setError(data.error || "Failed to submit answer");
+        return;
+      }
+    } catch {
+      setError("Network error. Try again.");
+    }
+  };
+
+  // Show quiz results (host only)
+  const handleShowQuizResults = async () => {
+    if (!game || !currentPlayer?.is_projector) return;
+    
+    // Clear the timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    
+    try {
+      const res = await fetch("/api/game/quiz/next", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gameCode: game.code,
+          playerId: currentPlayer.id,
+          action: "show_results",
+        }),
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok) {
+        setError(data.error || "Failed to show results");
+        return;
+      }
+
+      setGame(data.game);
+      setScoreChanges(data.scoreChanges || []);
+      
+      // Fetch answers for this question
+      if (currentQuizQuestion) {
+        await fetchQuizAnswers(currentQuizQuestion.id);
+      }
+      
+      // Refresh players to get updated scores
+      if (game?.id) {
+        const freshPlayers = await fetchPlayers(game.id);
+        setPlayers(freshPlayers);
+      }
+    } catch {
+      setError("Network error. Try again.");
+    }
+  };
+
+  // Move to next quiz question (host only)
+  const handleNextQuizQuestion = async () => {
+    if (!game || !currentPlayer?.is_projector) return;
+    
+    try {
+      const res = await fetch("/api/game/quiz/next", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gameCode: game.code,
+          playerId: currentPlayer.id,
+          action: "next_question",
+        }),
+      });
+
+      const data = await res.json();
+      
+      if (!res.ok) {
+        setError(data.error || "Failed to advance quiz");
+        return;
+      }
+
+      setGame(data.game);
+      setQuizAnswers([]);
+      setSelectedOption(null);
+      setHasSubmittedQuiz(false);
+      setScoreChanges([]);
+      setTimeLeft(20);
+    } catch {
+      setError("Network error. Try again.");
+    }
+  };
+
   // Update current question when game state changes
   useEffect(() => {
     async function updateCurrentQuestion() {
       if (!game) return;
       
-      // If game is playing but we don't have questions, fetch them
-      if (game.status === "playing" && game.phase === "asking" && questions.length === 0) {
+      // If game is playing (any phase except lobby) but we don't have questions, fetch them
+      if (game.status === "playing" && game.phase !== "lobby" && questions.length === 0) {
         console.log("Fetching questions because game is playing but questions are empty");
         await fetchQuestions(code);
         return; // Will re-run when questions are set
@@ -300,7 +528,7 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
       
       if (questions.length > 0 && game.current_question_number > 0) {
         const q = questions.find(q => q.question_number === game.current_question_number);
-        console.log("Setting current question:", q?.question_text);
+        console.log("Setting current question:", q?.question_text, "for question number:", game.current_question_number);
         setCurrentQuestion(q || null);
         
         // Check if player already answered this question
@@ -321,6 +549,87 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
     
     updateCurrentQuestion();
   }, [game?.current_question_number, game?.phase, game?.status, questions, currentPlayer, currentQuestion?.id, fetchAnswers, code, fetchQuestions]);
+
+  // Update current quiz question when game state changes
+  useEffect(() => {
+    async function updateCurrentQuizQuestion() {
+      if (!game) return;
+      
+      // If in quiz phase but no quiz questions, fetch them
+      if ((game.phase === "quiz_question" || game.phase === "quiz_results") && quizQuestions.length === 0) {
+        console.log("Fetching quiz questions");
+        await fetchQuizQuestions(code);
+        return;
+      }
+      
+      if (quizQuestions.length > 0 && game.current_quiz_question_number > 0) {
+        const q = quizQuestions.find(q => q.question_order === game.current_quiz_question_number);
+        console.log("Setting current quiz question:", q?.question_text);
+        setCurrentQuizQuestion(q || null);
+        
+        // Reset submission state for new question
+        if (q && currentQuizQuestion?.id !== q.id) {
+          setHasSubmittedQuiz(false);
+          setSelectedOption(null);
+          setScoreChanges([]);
+        }
+        
+        // If showing results, fetch quiz answers
+        if (game.phase === "quiz_results" && q) {
+          fetchQuizAnswers(q.id);
+        }
+      }
+    }
+    
+    updateCurrentQuizQuestion();
+  }, [game?.current_quiz_question_number, game?.phase, quizQuestions, currentQuizQuestion?.id, fetchQuizAnswers, code, fetchQuizQuestions]);
+
+  // Timer effect for quiz questions
+  useEffect(() => {
+    if (game?.phase !== "quiz_question" || !game?.question_deadline) {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      return;
+    }
+
+    const deadline = new Date(game.question_deadline).getTime();
+    
+    const updateTimer = () => {
+      const now = Date.now();
+      const remaining = Math.max(0, Math.ceil((deadline - now) / 1000));
+      setTimeLeft(remaining);
+    };
+
+    updateTimer();
+    timerRef.current = setInterval(updateTimer, 100);
+
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [game?.phase, game?.question_deadline]);
+
+  // Auto-show results when timer reaches 0 (host only)
+  useEffect(() => {
+    if (timeLeft === 0 && game?.phase === "quiz_question" && currentPlayer?.is_projector) {
+      handleShowQuizResults();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timeLeft, game?.phase, currentPlayer?.is_projector]);
+
+  // Keep currentPlayer in sync with players array (for score updates)
+  useEffect(() => {
+    if (currentPlayer && players.length > 0) {
+      const updated = players.find(p => p.id === currentPlayer.id);
+      if (updated && updated.score !== currentPlayer.score) {
+        setCurrentPlayer(updated);
+      }
+    }
+  }, [players, currentPlayer]);
 
   useEffect(() => {
     const playerId = localStorage.getItem("playerId");
@@ -377,9 +686,16 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         }
       }
 
-      // Fetch questions if game has started
-      if (gameData.status === "playing") {
-        await fetchQuestions(code);
+      // Fetch questions if game has started (any phase except lobby means questions exist)
+      if (gameData.status === "playing" && gameData.phase !== "lobby") {
+        const fetchedQuestions = await fetchQuestions(code);
+        // Set current question immediately if we have questions
+        if (fetchedQuestions && fetchedQuestions.length > 0 && gameData.current_question_number > 0) {
+          const q = fetchedQuestions.find((q: Question) => q.question_number === gameData.current_question_number);
+          if (q) {
+            setCurrentQuestion(q);
+          }
+        }
       }
 
       // Subscribe to player changes for this game
@@ -436,9 +752,16 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
             const updatedGame = payload.new as GameSession;
             setGame(updatedGame);
             
-            // Fetch questions when game starts
-            if (updatedGame.status === "playing" && updatedGame.phase === "asking") {
-              await fetchQuestions(code);
+            // Fetch questions when game is playing (any phase except lobby)
+            if (updatedGame.status === "playing" && updatedGame.phase !== "lobby") {
+              const fetchedQuestions = await fetchQuestions(code);
+              // Set current question immediately
+              if (fetchedQuestions && fetchedQuestions.length > 0 && updatedGame.current_question_number > 0) {
+                const q = fetchedQuestions.find((q: Question) => q.question_number === updatedGame.current_question_number);
+                if (q) {
+                  setCurrentQuestion(q);
+                }
+              }
             }
             
             // Reset answer state when moving to new question
@@ -473,6 +796,21 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
             }
           }
         )
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "quiz_answers",
+          },
+          async (payload) => {
+            console.log("Quiz answer event:", payload.eventType, payload);
+            // Refresh quiz answers if we're viewing results
+            if (game?.phase === "quiz_results" && game?.current_quiz_question_id) {
+              await fetchQuizAnswers(game.current_quiz_question_id);
+            }
+          }
+        )
         .subscribe();
 
       if (mounted) setLoading(false);
@@ -496,9 +834,14 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
           if (freshGame) {
             setGame(freshGame);
             
-            // Fetch questions if game is playing and we don't have them
-            if (freshGame.status === "playing" && questions.length === 0) {
+            // Fetch questions if game is playing and we don't have them (any phase except lobby)
+            if (freshGame.status === "playing" && freshGame.phase !== "lobby" && questions.length === 0) {
               await fetchQuestions(code);
+            }
+            
+            // Fetch quiz questions if in quiz phase and we don't have them
+            if ((freshGame.phase === "quiz_question" || freshGame.phase === "quiz_results") && quizQuestions.length === 0) {
+              await fetchQuizQuestions(code);
             }
           }
         }
@@ -521,7 +864,7 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         supabase?.removeChannel(answersChannel);
       }
     };
-  }, [code, fetchPlayers, fetchQuestions, game?.id, game?.phase, currentQuestion, fetchAnswers, questions.length]);
+  }, [code, fetchPlayers, fetchQuestions, fetchQuizQuestions, fetchQuizAnswers, game?.id, game?.phase, currentQuestion, fetchAnswers, questions.length, quizQuestions.length]);
 
   if (loading) {
     return (
@@ -695,12 +1038,342 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
                 <h2 className="text-4xl font-bold text-white mb-4">
                   Icebreakers Complete!
                 </h2>
-                <p className="text-zinc-400 text-xl">
-                  Now you know a bit more about each other!
+                <p className="text-zinc-400 text-xl mb-8">
+                  Now it's time for the quiz round!
                 </p>
-                <p className="text-zinc-500 mt-8">
-                  Quiz round coming soon...
-                </p>
+                <button
+                  onClick={handleStartQuiz}
+                  disabled={generatingQuiz}
+                  className="px-10 py-5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 disabled:opacity-50 text-white rounded-2xl font-bold text-xl transition-all transform hover:scale-105 shadow-xl shadow-amber-500/20"
+                >
+                  {generatingQuiz ? (
+                    <span className="flex items-center gap-3">
+                      <div className="w-6 h-6 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Generating Quiz...
+                    </span>
+                  ) : (
+                    "🎯 Start Quiz Round →"
+                  )}
+                </button>
+              </div>
+            ) : game?.phase === "quiz_question" ? (
+              /* Quiz Question View - Host */
+              <div className="w-full max-w-5xl">
+                {/* Timer */}
+                <div className="flex justify-center mb-8">
+                  <div className={`
+                    relative w-32 h-32 rounded-full flex items-center justify-center
+                    ${timeLeft <= 5 ? "bg-red-500/20" : "bg-violet-500/20"}
+                  `}>
+                    <div className={`
+                      absolute inset-2 rounded-full border-4
+                      ${timeLeft <= 5 ? "border-red-500" : "border-violet-500"}
+                    `} style={{
+                      background: `conic-gradient(${timeLeft <= 5 ? "#ef4444" : "#8b5cf6"} ${(timeLeft / 20) * 360}deg, transparent 0deg)`
+                    }} />
+                    <span className={`text-5xl font-black ${timeLeft <= 5 ? "text-red-400 animate-pulse" : "text-white"}`}>
+                      {timeLeft}
+                    </span>
+                  </div>
+                </div>
+
+                {/* About Player Badge */}
+                {currentQuizQuestion?.players && (
+                  <div className="flex justify-center mb-6">
+                    <div className="px-6 py-3 bg-zinc-800/60 rounded-full flex items-center gap-3">
+                      <div
+                        className="w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold"
+                        style={{ backgroundColor: currentQuizQuestion.players.avatar_color }}
+                      >
+                        {currentQuizQuestion.players.name.charAt(0).toUpperCase()}
+                      </div>
+                      <span className="text-zinc-300">
+                        About <span className="text-white font-bold">{currentQuizQuestion.players.name}</span>
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Question */}
+                <div className="text-center mb-10">
+                  <p className="text-amber-400 text-lg font-medium mb-4 uppercase tracking-wider">
+                    Question {game?.current_quiz_question_number} of {quizQuestions.length}
+                  </p>
+                  <h2 className="text-4xl font-bold leading-tight bg-gradient-to-r from-white via-zinc-200 to-zinc-400 bg-clip-text text-transparent">
+                    {currentQuizQuestion?.question_text || "Loading question..."}
+                  </h2>
+                </div>
+
+                {/* Options Grid */}
+                <div className="grid grid-cols-2 gap-4 mb-10">
+                  {[
+                    { key: "A", value: currentQuizQuestion?.option_a },
+                    { key: "B", value: currentQuizQuestion?.option_b },
+                    { key: "C", value: currentQuizQuestion?.option_c },
+                    { key: "D", value: currentQuizQuestion?.option_d },
+                  ].map((option) => (
+                    <div
+                      key={option.key}
+                      className="bg-zinc-800/60 backdrop-blur-xl border border-zinc-700 rounded-2xl p-6 flex items-start gap-4"
+                    >
+                      <span className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center text-2xl font-black flex-shrink-0">
+                        {option.key}
+                      </span>
+                      <p className="text-xl text-white pt-2">{option.value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Show Results Button */}
+                <div className="text-center">
+                  <button
+                    onClick={handleShowQuizResults}
+                    className="px-10 py-5 bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white rounded-2xl font-bold text-xl transition-all transform hover:scale-105 shadow-xl shadow-violet-500/20"
+                  >
+                    Show Results →
+                  </button>
+                </div>
+
+                {/* Player Answer Status */}
+                <div className="flex justify-center gap-4 mt-8">
+                  {regularPlayers.map((player) => {
+                    const hasAnswered = quizAnswers.some(a => a.player_id === player.id);
+                    return (
+                      <div key={player.id} className="flex flex-col items-center gap-2">
+                        <div
+                          className={`w-14 h-14 rounded-full flex items-center justify-center text-xl font-bold border-4 transition-all ${
+                            hasAnswered ? "border-emerald-500 scale-110" : "border-zinc-600"
+                          }`}
+                          style={{ backgroundColor: player.avatar_color }}
+                        >
+                          {player.name.charAt(0).toUpperCase()}
+                        </div>
+                        <p className="text-zinc-400 text-xs">{player.name}</p>
+                        {hasAnswered && <span className="text-emerald-400 text-xs">✓</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : game?.phase === "quiz_results" ? (
+              /* Quiz Results View - Host */
+              <div className="w-full max-w-5xl">
+                {/* About Player Badge */}
+                {currentQuizQuestion?.players && (
+                  <div className="flex justify-center mb-6">
+                    <div className="px-6 py-3 bg-zinc-800/60 rounded-full flex items-center gap-3">
+                      <div
+                        className="w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold"
+                        style={{ backgroundColor: currentQuizQuestion.players.avatar_color }}
+                      >
+                        {currentQuizQuestion.players.name.charAt(0).toUpperCase()}
+                      </div>
+                      <span className="text-zinc-300">
+                        About <span className="text-white font-bold">{currentQuizQuestion.players.name}</span>
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Question */}
+                <div className="text-center mb-8">
+                  <h2 className="text-2xl font-bold text-zinc-300">
+                    {currentQuizQuestion?.question_text}
+                  </h2>
+                </div>
+
+                {/* Options with Results */}
+                <div className="grid grid-cols-2 gap-4 mb-10">
+                  {[
+                    { key: "A", value: currentQuizQuestion?.option_a },
+                    { key: "B", value: currentQuizQuestion?.option_b },
+                    { key: "C", value: currentQuizQuestion?.option_c },
+                    { key: "D", value: currentQuizQuestion?.option_d },
+                  ].map((option) => {
+                    const isCorrect = currentQuizQuestion?.correct_answer === option.key;
+                    const playersWhoChoseThis = quizAnswers.filter(a => a.selected_option === option.key);
+                    
+                    return (
+                      <div
+                        key={option.key}
+                        className={`
+                          backdrop-blur-xl border rounded-2xl p-6 transition-all
+                          ${isCorrect 
+                            ? "bg-emerald-500/20 border-emerald-500" 
+                            : playersWhoChoseThis.length > 0 
+                              ? "bg-red-500/10 border-red-500/50" 
+                              : "bg-zinc-800/60 border-zinc-700"
+                          }
+                        `}
+                      >
+                        <div className="flex items-start gap-4">
+                          <span className={`
+                            w-12 h-12 rounded-xl flex items-center justify-center text-2xl font-black flex-shrink-0
+                            ${isCorrect 
+                              ? "bg-emerald-500" 
+                              : "bg-gradient-to-br from-violet-500 to-fuchsia-500"
+                            }
+                          `}>
+                            {isCorrect ? "✓" : option.key}
+                          </span>
+                          <div className="flex-1">
+                            <p className="text-xl text-white">{option.value}</p>
+                            {/* Players who chose this */}
+                            {playersWhoChoseThis.length > 0 && (
+                              <div className="flex gap-2 mt-3">
+                                {playersWhoChoseThis.map(answer => (
+                                  <div
+                                    key={answer.id}
+                                    className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold"
+                                    style={{ backgroundColor: answer.players?.avatar_color || "#6366f1" }}
+                                    title={answer.players?.name}
+                                  >
+                                    {answer.players?.name?.charAt(0).toUpperCase() || "?"}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Score Changes */}
+                {scoreChanges.length > 0 && (
+                  <div className="bg-zinc-900/60 backdrop-blur-xl border border-zinc-700 rounded-2xl p-6 mb-8">
+                    <h3 className="text-lg font-bold text-zinc-300 mb-4 text-center">Score Changes</h3>
+                    <div className="flex flex-wrap justify-center gap-4">
+                      {scoreChanges.map((change, idx) => {
+                        const player = players.find(p => p.id === change.playerId);
+                        if (!player) return null;
+                        return (
+                          <div key={idx} className="flex items-center gap-3 bg-zinc-800/60 px-4 py-2 rounded-xl">
+                            <div
+                              className="w-10 h-10 rounded-full flex items-center justify-center font-bold"
+                              style={{ backgroundColor: player.avatar_color }}
+                            >
+                              {player.name.charAt(0).toUpperCase()}
+                            </div>
+                            <div>
+                              <p className="text-white font-medium">{player.name}</p>
+                              <p className={`text-sm ${change.change > 0 ? "text-emerald-400" : change.change < 0 ? "text-red-400" : "text-zinc-400"}`}>
+                                {change.change > 0 ? `+${change.change}` : change.change} {change.reason}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Next Question Button */}
+                <div className="text-center">
+                  <button
+                    onClick={handleNextQuizQuestion}
+                    className="px-10 py-5 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white rounded-2xl font-bold text-xl transition-all transform hover:scale-105 shadow-xl shadow-emerald-500/20"
+                  >
+                    {(game?.current_quiz_question_number || 0) >= quizQuestions.length
+                      ? "🏆 See Final Results →"
+                      : "Next Question →"}
+                  </button>
+                </div>
+
+                {/* Current Scores */}
+                <div className="mt-8 flex justify-center gap-6">
+                  {regularPlayers
+                    .sort((a, b) => b.score - a.score)
+                    .map((player, idx) => (
+                      <div key={player.id} className="flex flex-col items-center gap-2">
+                        <div
+                          className={`w-16 h-16 rounded-full flex items-center justify-center text-2xl font-bold border-4 ${
+                            idx === 0 ? "border-amber-400" : "border-zinc-600"
+                          }`}
+                          style={{ backgroundColor: player.avatar_color }}
+                        >
+                          {player.name.charAt(0).toUpperCase()}
+                        </div>
+                        <p className="text-white font-medium">{player.name}</p>
+                        <p className="text-2xl font-black text-amber-400">{player.score}</p>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            ) : game?.phase === "game_over" ? (
+              /* Game Over View - Host */
+              <div className="w-full max-w-4xl text-center">
+                <div className="text-8xl mb-8">🏆</div>
+                <h2 className="text-5xl font-black text-white mb-4">Game Over!</h2>
+                <p className="text-xl text-zinc-400 mb-12">Final Scores</p>
+
+                {/* Winner & Standings */}
+                <div className="flex justify-center items-end gap-4 mb-12">
+                  {regularPlayers
+                    .sort((a, b) => b.score - a.score)
+                    .slice(0, 3)
+                    .map((player, idx) => {
+                      const heights = ["h-40", "h-32", "h-24"];
+                      const colors = ["from-amber-400 to-yellow-500", "from-zinc-300 to-zinc-400", "from-amber-600 to-amber-700"];
+                      const positions = [1, 0, 2];
+                      const actualIdx = positions[idx];
+                      
+                      return (
+                        <div key={player.id} className="flex flex-col items-center" style={{ order: actualIdx }}>
+                          <div
+                            className="w-20 h-20 rounded-full flex items-center justify-center text-3xl font-bold mb-4 border-4 border-white/20"
+                            style={{ backgroundColor: player.avatar_color }}
+                          >
+                            {player.name.charAt(0).toUpperCase()}
+                          </div>
+                          <p className="text-white font-bold text-lg mb-2">{player.name}</p>
+                          <div className={`${heights[idx]} w-28 bg-gradient-to-t ${colors[idx]} rounded-t-xl flex items-start justify-center pt-4`}>
+                            <span className="text-3xl font-black text-white">{player.score}</span>
+                          </div>
+                          <div className="bg-zinc-800 w-28 py-2 text-center">
+                            <span className="text-2xl font-bold">{idx === 0 ? "🥇" : idx === 1 ? "🥈" : "🥉"}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+
+                {/* All Players Scores */}
+                {regularPlayers.length > 3 && (
+                  <div className="bg-zinc-900/60 backdrop-blur-xl border border-zinc-700 rounded-2xl p-6">
+                    <h3 className="text-lg font-bold text-zinc-300 mb-4">All Players</h3>
+                    <div className="space-y-2">
+                      {regularPlayers
+                        .sort((a, b) => b.score - a.score)
+                        .map((player, idx) => (
+                          <div key={player.id} className="flex items-center justify-between px-4 py-2 bg-zinc-800/50 rounded-xl">
+                            <div className="flex items-center gap-3">
+                              <span className="text-zinc-500 w-6">{idx + 1}.</span>
+                              <div
+                                className="w-8 h-8 rounded-full flex items-center justify-center font-bold"
+                                style={{ backgroundColor: player.avatar_color }}
+                              >
+                                {player.name.charAt(0).toUpperCase()}
+                              </div>
+                              <span className="text-white">{player.name}</span>
+                            </div>
+                            <span className="text-amber-400 font-bold">{player.score} pts</span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Play Again */}
+                <div className="mt-12">
+                  <a
+                    href="/"
+                    className="px-8 py-4 bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white rounded-2xl font-bold text-lg transition-all inline-block"
+                  >
+                    Play Again →
+                  </a>
+                </div>
               </div>
             ) : null}
           </div>
@@ -933,24 +1606,243 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
               )}
             </>
           ) : game?.phase === "showing_answers" ? (
-            <div className="text-center py-12">
-              <div className="text-5xl mb-6">👀</div>
-              <h2 className="text-2xl font-bold text-white mb-4">
+            <div className="text-center py-8">
+              {/* Show the question that was asked */}
+              {currentQuestion && (
+                <div className="bg-zinc-800/60 rounded-2xl px-5 py-4 mb-6">
+                  <p className="text-violet-400 text-xs font-medium mb-2 uppercase tracking-wider">
+                    Question {game?.current_question_number || 1}
+                  </p>
+                  <p className="text-white text-lg font-medium">
+                    {currentQuestion.question_text}
+                  </p>
+                </div>
+              )}
+              <div className="text-5xl mb-4">👀</div>
+              <h2 className="text-xl font-bold text-white mb-2">
                 Look at the screen!
               </h2>
-              <p className="text-zinc-400">
+              <p className="text-zinc-400 text-sm">
                 See what everyone answered
               </p>
             </div>
           ) : game?.phase === "quiz" ? (
             <div className="text-center py-12">
-              <div className="text-5xl mb-6">🎉</div>
+              <div className="text-5xl mb-6">🎯</div>
               <h2 className="text-2xl font-bold text-white mb-4">
-                Icebreakers done!
+                Get Ready!
               </h2>
               <p className="text-zinc-400">
-                Get ready for the quiz...
+                The quiz round is about to begin...
               </p>
+            </div>
+          ) : game?.phase === "quiz_question" ? (
+            /* Quiz Question View - Player */
+            <>
+              {/* Timer */}
+              <div className="flex justify-center mb-6">
+                <div className={`
+                  relative w-24 h-24 rounded-full flex items-center justify-center
+                  ${timeLeft <= 5 ? "bg-red-500/20" : "bg-violet-500/20"}
+                `}>
+                  <span className={`text-4xl font-black ${timeLeft <= 5 ? "text-red-400 animate-pulse" : "text-white"}`}>
+                    {timeLeft}
+                  </span>
+                </div>
+              </div>
+
+              {/* About Player Badge */}
+              {currentQuizQuestion?.players && (
+                <div className="flex justify-center mb-4">
+                  <div className="px-4 py-2 bg-zinc-800/60 rounded-full flex items-center gap-2 text-sm">
+                    <div
+                      className="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold"
+                      style={{ backgroundColor: currentQuizQuestion.players.avatar_color }}
+                    >
+                      {currentQuizQuestion.players.name.charAt(0).toUpperCase()}
+                    </div>
+                    <span className="text-zinc-300">
+                      About <span className="text-white font-bold">{currentQuizQuestion.players.name}</span>
+                    </span>
+                    {currentQuizQuestion.about_player_id === currentPlayer?.id && (
+                      <span className="text-amber-400 text-xs">(You!)</span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Question */}
+              <div className="bg-gradient-to-br from-violet-600/20 to-fuchsia-600/20 border border-violet-500/30 rounded-2xl p-5 mb-6 backdrop-blur-xl">
+                <p className="text-amber-400 text-xs font-medium mb-2 uppercase tracking-wider text-center">
+                  Question {game?.current_quiz_question_number} of {quizQuestions.length}
+                </p>
+                <h2 className="text-lg font-bold text-white leading-relaxed text-center">
+                  {currentQuizQuestion?.question_text || "Loading..."}
+                </h2>
+              </div>
+
+              {/* Options */}
+              {!hasSubmittedQuiz ? (
+                <div className="space-y-3">
+                  {[
+                    { key: "A", value: currentQuizQuestion?.option_a },
+                    { key: "B", value: currentQuizQuestion?.option_b },
+                    { key: "C", value: currentQuizQuestion?.option_c },
+                    { key: "D", value: currentQuizQuestion?.option_d },
+                  ].map((option) => (
+                    <button
+                      key={option.key}
+                      onClick={() => handleSubmitQuizAnswer(option.key)}
+                      disabled={hasSubmittedQuiz}
+                      className="w-full p-4 bg-zinc-800/80 hover:bg-zinc-700/80 border border-zinc-700 hover:border-violet-500 rounded-xl text-left transition-all flex items-center gap-3 active:scale-[0.98]"
+                    >
+                      <span className="w-10 h-10 rounded-lg bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center text-lg font-black flex-shrink-0">
+                        {option.key}
+                      </span>
+                      <span className="text-white">{option.value}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center py-8 bg-zinc-900/40 rounded-2xl border border-zinc-800">
+                  <div className="w-16 h-16 rounded-full bg-violet-500/20 flex items-center justify-center mx-auto mb-4">
+                    <span className="text-3xl font-black text-violet-400">{selectedOption}</span>
+                  </div>
+                  <p className="text-violet-400 font-bold text-lg mb-2">Answer locked in!</p>
+                  <p className="text-zinc-500">Waiting for results...</p>
+                </div>
+              )}
+            </>
+          ) : game?.phase === "quiz_results" ? (
+            /* Quiz Results View - Player */
+            <div className="text-center">
+              {/* Show what happened */}
+              {currentQuizQuestion && (
+                <div className="mb-6">
+                  <p className="text-zinc-400 text-sm mb-2">The correct answer was:</p>
+                  <div className="bg-emerald-500/20 border border-emerald-500 rounded-xl px-6 py-4 inline-block">
+                    <span className="text-emerald-400 font-bold text-xl">
+                      {currentQuizQuestion.correct_answer}: {
+                        currentQuizQuestion.correct_answer === "A" ? currentQuizQuestion.option_a :
+                        currentQuizQuestion.correct_answer === "B" ? currentQuizQuestion.option_b :
+                        currentQuizQuestion.correct_answer === "C" ? currentQuizQuestion.option_c :
+                        currentQuizQuestion.option_d
+                      }
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Player's result */}
+              {selectedOption && (
+                <div className={`mb-6 p-4 rounded-xl ${
+                  selectedOption === currentQuizQuestion?.correct_answer
+                    ? "bg-emerald-500/20 border border-emerald-500"
+                    : "bg-red-500/20 border border-red-500"
+                }`}>
+                  {selectedOption === currentQuizQuestion?.correct_answer ? (
+                    <>
+                      <div className="text-4xl mb-2">🎉</div>
+                      <p className="text-emerald-400 font-bold text-lg">Correct!</p>
+                      {currentQuizQuestion?.about_player_id === currentPlayer?.id ? (
+                        <p className="text-emerald-300 text-sm">+2 points for knowing yourself!</p>
+                      ) : (
+                        <p className="text-emerald-300 text-sm">+1 point</p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <div className="text-4xl mb-2">😅</div>
+                      <p className="text-red-400 font-bold text-lg">Wrong!</p>
+                      {currentQuizQuestion?.about_player_id === currentPlayer?.id && (
+                        <p className="text-red-300 text-sm">-1 point for not knowing yourself!</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {!selectedOption && (
+                <div className="mb-6 p-4 rounded-xl bg-zinc-800/60 border border-zinc-700">
+                  <div className="text-4xl mb-2">⏰</div>
+                  <p className="text-zinc-400 font-bold text-lg">Time's up!</p>
+                  {currentQuizQuestion?.about_player_id === currentPlayer?.id && (
+                    <p className="text-red-300 text-sm">-1 point for not answering your own question!</p>
+                  )}
+                </div>
+              )}
+
+              {/* Current Score */}
+              <div className="bg-zinc-900/60 rounded-xl px-6 py-4 inline-block">
+                <p className="text-zinc-400 text-sm">Your Score</p>
+                <p className="text-4xl font-black text-amber-400">{currentPlayer?.score || 0}</p>
+              </div>
+
+              <p className="text-zinc-500 text-sm mt-6">Watch the screen for next question...</p>
+            </div>
+          ) : game?.phase === "game_over" ? (
+            /* Game Over View - Player */
+            <div className="text-center">
+              <div className="text-6xl mb-6">🏆</div>
+              <h2 className="text-3xl font-black text-white mb-4">Game Over!</h2>
+              
+              {/* Player's final position */}
+              {(() => {
+                const sortedPlayers = [...regularPlayers].sort((a, b) => b.score - a.score);
+                const position = sortedPlayers.findIndex(p => p.id === currentPlayer?.id) + 1;
+                const isWinner = position === 1;
+                
+                return (
+                  <div className={`mb-8 p-6 rounded-2xl ${isWinner ? "bg-amber-500/20 border-2 border-amber-400" : "bg-zinc-800/60"}`}>
+                    {isWinner ? (
+                      <>
+                        <div className="text-5xl mb-2">🥇</div>
+                        <p className="text-amber-400 font-bold text-2xl">You Won!</p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-zinc-400 mb-2">You placed</p>
+                        <p className="text-4xl font-black text-white">#{position}</p>
+                      </>
+                    )}
+                    <p className="text-3xl font-black text-amber-400 mt-4">{currentPlayer?.score} points</p>
+                  </div>
+                );
+              })()}
+
+              {/* All scores */}
+              <div className="space-y-2">
+                {regularPlayers
+                  .sort((a, b) => b.score - a.score)
+                  .map((player, idx) => (
+                    <div
+                      key={player.id}
+                      className={`flex items-center justify-between px-4 py-3 rounded-xl ${
+                        player.id === currentPlayer?.id ? "bg-violet-500/20 border border-violet-500" : "bg-zinc-800/50"
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="text-zinc-500 w-6">{idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : `${idx + 1}.`}</span>
+                        <div
+                          className="w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm"
+                          style={{ backgroundColor: player.avatar_color }}
+                        >
+                          {player.name.charAt(0).toUpperCase()}
+                        </div>
+                        <span className="text-white">{player.name}</span>
+                      </div>
+                      <span className="text-amber-400 font-bold">{player.score}</span>
+                    </div>
+                  ))}
+              </div>
+
+              {/* Play Again */}
+              <a
+                href="/"
+                className="mt-8 px-6 py-3 bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white rounded-xl font-bold inline-block"
+              >
+                Play Again
+              </a>
             </div>
           ) : null}
 
