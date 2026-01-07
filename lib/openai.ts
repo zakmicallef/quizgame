@@ -73,10 +73,11 @@ export type QuizQuestion = {
 }
 
 // Generate quiz questions based on all players' icebreaker answers
+// Creates trivia questions about the things players mentioned
 export async function generateQuizQuestions(
   playersData: PlayerIcebreakerData[]
 ): Promise<QuizQuestion[]> {
-  const QUESTIONS_PER_PLAYER = 4
+  const QUESTIONS_PER_PLAYER = 2
   const allQuestions: QuizQuestion[] = []
 
   // Generate questions for each player
@@ -86,6 +87,8 @@ export async function generateQuizQuestions(
   }
 
   // Interleave questions so they alternate between players
+  // Round 1: Player A Q1, Player B Q1, Player C Q1...
+  // Round 2: Player A Q2, Player B Q2, Player C Q2...
   const interleavedQuestions: QuizQuestion[] = []
   for (let round = 0; round < QUESTIONS_PER_PLAYER; round++) {
     for (const playerData of playersData) {
@@ -103,49 +106,52 @@ export async function generateQuizQuestions(
   return interleavedQuestions
 }
 
-// Generate 4 quiz questions for a specific player based on their answers
+// Generate 2 quiz questions for a specific player based on their answers
+// Questions are TRIVIA about the things they mentioned (movies, hobbies, etc.)
 async function generateQuestionsForPlayer(
   player: PlayerIcebreakerData,
   allPlayers: PlayerIcebreakerData[]
 ): Promise<QuizQuestion[]> {
-  const QUESTIONS_PER_PLAYER = 4
+  const QUESTIONS_PER_PLAYER = 2
   
-  // Create a context with all answers for generating plausible wrong options
+  // Collect all other players' answers for variety
   const otherPlayersAnswers = allPlayers
     .filter(p => p.playerId !== player.playerId)
     .map(p => p.answers.map(a => a.answer))
     .flat()
 
-  const prompt = `You are creating quiz questions for a fun party game. Based on ${player.playerName}'s answers to icebreaker questions, generate ${QUESTIONS_PER_PLAYER} multiple choice questions where the goal is to guess what ${player.playerName} answered.
+  const prompt = `You are creating trivia quiz questions for a fun party game. ${player.playerName} answered some icebreaker questions about their interests. Your job is to create TRIVIA questions about the things they mentioned.
 
 ${player.playerName}'s answers:
 ${player.answers.map((a, i) => `Q${i + 1}: "${a.question}"\n${player.playerName}'s answer: "${a.answer}"`).join('\n\n')}
 
-Other players' answers (use these to create plausible wrong options):
-${otherPlayersAnswers.slice(0, 10).join(', ')}
+TASK: Generate ${QUESTIONS_PER_PLAYER} trivia questions ABOUT the subjects/topics that ${player.playerName} mentioned. The person who gave this answer should have an advantage because they know about their favorite things!
+
+EXAMPLES:
+- If they said their favorite movie is "The Matrix" → Ask: "In The Matrix, what color pill does Morpheus offer Neo to show him the truth?" (Answer: Red)
+- If they said their hobby is "playing guitar" → Ask: "How many strings does a standard acoustic guitar have?" (Answer: 6)
+- If they said their favorite show is "Breaking Bad" → Ask: "What is the street name of the blue meth that Walter White produces in Breaking Bad?" (Answer: Blue Sky)
+- If they said they like "hiking" → Ask: "What is the longest hiking trail in the United States?" (Answer: Pacific Crest Trail / Appalachian Trail)
 
 IMPORTANT RULES:
 1. Create exactly ${QUESTIONS_PER_PLAYER} questions
-2. Each question should ask "What did ${player.playerName} answer when asked..." or similar phrasing
-3. The correct answer should be ${player.playerName}'s actual answer (can be slightly rephrased for clarity)
-4. Wrong options should be plausible (use other players' answers or similar realistic options)
-5. Options should be roughly similar in length and style
-6. Make questions fun and engaging!
+2. Questions should be TRIVIA about the thing they mentioned, NOT asking what they answered
+3. Questions should be at a casual/fun difficulty - not too obscure
+4. Frame the question to mention who it's about, e.g., "${player.playerName} said they love [topic]. [Trivia question about that topic]?"
+5. Make the wrong options plausible but clearly wrong to someone who knows the subject
+6. RANDOMIZE which option (A, B, C, or D) is correct!
 
-Return ONLY a JSON array with exactly ${QUESTIONS_PER_PLAYER} objects in this format:
+Return ONLY a JSON array with exactly ${QUESTIONS_PER_PLAYER} objects:
 [
   {
-    "questionText": "What did ${player.playerName} say when asked about their favorite hobby?",
-    "correctAnswer": "A",
-    "optionA": "The correct answer here",
-    "optionB": "Wrong option 1",
-    "optionC": "Wrong option 2",
-    "optionD": "Wrong option 3"
+    "questionText": "${player.playerName} said their favorite movie is X. In that movie, [trivia question]?",
+    "correctAnswer": "B",
+    "optionA": "Wrong but plausible option",
+    "optionB": "The correct answer",
+    "optionC": "Wrong but plausible option",
+    "optionD": "Wrong but plausible option"
   }
-]
-
-The "correctAnswer" field should be "A", "B", "C", or "D" indicating which option is correct.
-RANDOMIZE which option (A, B, C, or D) is correct - don't always make A correct!`
+]`
 
   try {
     const response = await openai.chat.completions.create({
@@ -153,7 +159,7 @@ RANDOMIZE which option (A, B, C, or D) is correct - don't always make A correct!
       messages: [
         {
           role: 'system',
-          content: 'You are a fun party game host creating engaging quiz questions. Return ONLY valid JSON, no markdown or explanation.'
+          content: 'You are a fun trivia game host. Create engaging trivia questions about specific topics. The questions should test knowledge ABOUT the subject, not just recall what someone said. Return ONLY valid JSON, no markdown or explanation.'
         },
         {
           role: 'user',
@@ -198,16 +204,16 @@ RANDOMIZE which option (A, B, C, or D) is correct - don't always make A correct!
   } catch (error) {
     console.error('Error generating questions for player:', player.playerName, error)
     
-    // Generate fallback questions based on available answers
-    return player.answers.slice(0, QUESTIONS_PER_PLAYER).map((answer, idx) => ({
+    // Generate fallback questions - still try to make them about the topic
+    return player.answers.slice(0, QUESTIONS_PER_PLAYER).map((answer) => ({
       aboutPlayerId: player.playerId,
       aboutPlayerName: player.playerName,
-      questionText: `What did ${player.playerName} answer to: "${answer.question}"?`,
+      questionText: `${player.playerName} mentioned "${answer.answer}". What do you know about it?`,
       correctAnswer: 'A',
-      optionA: answer.answer,
-      optionB: otherPlayersAnswers[idx] || 'Something else',
-      optionC: otherPlayersAnswers[idx + 1] || 'None of these',
-      optionD: otherPlayersAnswers[idx + 2] || 'I don\'t know',
+      optionA: 'It\'s something they enjoy',
+      optionB: otherPlayersAnswers[0] || 'Something else',
+      optionC: otherPlayersAnswers[1] || 'None of these',
+      optionD: otherPlayersAnswers[2] || 'I don\'t know',
     }))
   }
 }
