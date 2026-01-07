@@ -175,6 +175,11 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
       }
 
       setQuestions(data.questions);
+      
+      // Update game state with the returned game (includes current_question_number: 1)
+      if (data.game) {
+        setGame(data.game);
+      }
     } catch {
       setError("Network error. Try again.");
     } finally {
@@ -1551,6 +1556,31 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         />
 
         <div className="relative z-10 w-full max-w-lg">
+          {/* Debug: show current phase + refresh button */}
+          <div className="absolute top-2 right-2 flex items-center gap-2">
+            <span className="text-xs text-zinc-600 bg-zinc-900/50 px-2 py-1 rounded">
+              {game?.phase} | Q{game?.current_question_number}
+            </span>
+            <button
+              onClick={async () => {
+                if (!supabase || !game?.id) return;
+                const { data: freshGame } = await supabase
+                  .from("game_sessions")
+                  .select("*")
+                  .eq("id", game.id)
+                  .single();
+                if (freshGame) {
+                  setGame(freshGame);
+                  setHasSubmitted(false);
+                  setMyAnswer("");
+                }
+              }}
+              className="text-xs text-zinc-500 hover:text-white bg-zinc-800 px-2 py-1 rounded"
+            >
+              ↻
+            </button>
+          </div>
+          
           {game?.phase === "asking" ? (
             <>
               {/* Question Card - Prominent Display */}

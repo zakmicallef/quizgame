@@ -73,7 +73,7 @@ export async function POST(request: Request) {
     }
 
     // Update game to start asking phase with question 1
-    await supabase
+    const { data: updatedGame } = await supabase
       .from('game_sessions')
       .update({ 
         phase: 'asking',
@@ -81,8 +81,10 @@ export async function POST(request: Request) {
         current_question_id: questions?.find(q => q.question_number === 1)?.id
       })
       .eq('id', game.id)
+      .select()
+      .single()
 
-    return NextResponse.json({ questions })
+    return NextResponse.json({ questions, game: updatedGame })
   } catch (err) {
     console.error('Generate questions error:', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
@@ -131,4 +133,5 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
+
 
