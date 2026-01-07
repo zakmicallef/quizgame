@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, use } from "react";
+import { useEffect, useState, useCallback, use } from "react";
 import { supabase } from "@/lib/supabase";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
@@ -23,15 +23,25 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
   const { code } = use(params);
   const [game, setGame] = useState<GameSession | null>(null);
   const [players, setPlayers] = useState<Player[]>([]);
-  const [isProjector, setIsProjector] = useState(false);
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  // Fetch players from database
+  const fetchPlayers = useCallback(async (gameId: string) => {
+    if (!supabase) return [];
+    
+    const { data: playersData } = await supabase
+      .from("players")
+      .select("*")
+      .eq("game_id", gameId)
+      .order("joined_at", { ascending: true });
+    
+    return playersData || [];
+  }, []);
+
   useEffect(() => {
     const playerId = localStorage.getItem("playerId");
-    const isProj = localStorage.getItem("isProjector") === "true";
-    setIsProjector(isProj);
 
     if (!supabase) {
       setError("Database not configured");
@@ -39,7 +49,14 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
       return;
     }
 
+    if (!playerId) {
+      setError("No player ID found. Please join from home page.");
+      setLoading(false);
+      return;
+    }
+
     let channel: RealtimeChannel | null = null;
+    let mounted = true;
 
     async function loadGame() {
       // Fetch game
@@ -50,89 +67,96 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
         .single();
 
       if (gameError || !gameData) {
-        setError("Game not found");
-        setLoading(false);
+        if (mounted) {
+          setError("Game not found");
+          setLoading(false);
+        }
         return;
       }
 
-      setGame(gameData);
+      if (mounted) setGame(gameData);
 
-      // Fetch players
-      const { data: playersData } = await supabase!
-        .from("players")
-        .select("*")
-        .eq("game_id", gameData.id)
-        .order("joined_at", { ascending: true });
-
-      if (playersData) {
+      // Fetch all players
+      const playersData = await fetchPlayers(gameData.id);
+      
+      if (mounted) {
         setPlayers(playersData);
+        
+        // Find current player by ID from localStorage
         const me = playersData.find((p) => p.id === playerId);
-        if (me) setCurrentPlayer(me);
+        if (me) {
+          setCurrentPlayer(me);
+        } else {
+          setError("You are not in this game. Please join from home page.");
+          setLoading(false);
+          return;
+        }
       }
 
-      // Subscribe to player changes
+      // Subscribe to ALL player changes for this game
       channel = supabase!
-        .channel(`game-${gameData.id}`)
+        .channel(`game-players-${gameData.id}`)
         .on(
           "postgres_changes",
           {
-            event: "INSERT",
+            event: "*", // Listen to all events: INSERT, UPDATE, DELETE
             schema: "public",
             table: "players",
             filter: `game_id=eq.${gameData.id}`,
           },
-          (payload) => {
-            console.log("Player joined:", payload.new);
-            setPlayers((prev) => {
-              // Avoid duplicates
-              if (prev.some(p => p.id === (payload.new as Player).id)) return prev;
-              return [...prev, payload.new as Player];
-            });
+          async (payload) => {
+            console.log("Realtime event:", payload.eventType, payload);
+            
+            if (payload.eventType === "INSERT") {
+              const newPlayer = payload.new as Player;
+              setPlayers((prev) => {
+                // Avoid duplicates
+                if (prev.some((p) => p.id === newPlayer.id)) return prev;
+                return [...prev, newPlayer];
+              });
+            } else if (payload.eventType === "DELETE") {
+              const oldPlayer = payload.old as { id: string };
+              setPlayers((prev) => prev.filter((p) => p.id !== oldPlayer.id));
+            } else if (payload.eventType === "UPDATE") {
+              const updatedPlayer = payload.new as Player;
+              setPlayers((prev) =>
+                prev.map((p) => (p.id === updatedPlayer.id ? updatedPlayer : p))
+              );
+            }
           }
         )
-        .on(
-          "postgres_changes",
-          {
-            event: "DELETE",
-            schema: "public",
-            table: "players",
-            filter: `game_id=eq.${gameData.id}`,
-          },
-          (payload) => {
-            console.log("Player left:", payload.old);
-            setPlayers((prev) => prev.filter((p) => p.id !== payload.old.id));
+        .subscribe((status, err) => {
+          console.log("Realtime subscription:", status, err);
+          if (status === "SUBSCRIBED") {
+            console.log("✓ Listening for player changes");
           }
-        )
-        .on(
-          "postgres_changes",
-          {
-            event: "UPDATE",
-            schema: "public",
-            table: "players",
-            filter: `game_id=eq.${gameData.id}`,
-          },
-          (payload) => {
-            console.log("Player updated:", payload.new);
-            setPlayers((prev) =>
-              prev.map((p) => (p.id === (payload.new as Player).id ? (payload.new as Player) : p))
-            );
+          if (status === "CHANNEL_ERROR") {
+            console.error("Realtime error:", err);
           }
-        )
-        .subscribe((status) => {
-          console.log("Realtime subscription status:", status);
         });
 
-      setLoading(false);
+      if (mounted) setLoading(false);
     }
 
     loadGame();
 
+    // Poll for updates as backup (every 3 seconds)
+    const pollInterval = setInterval(async () => {
+      if (game?.id) {
+        const freshPlayers = await fetchPlayers(game.id);
+        setPlayers(freshPlayers);
+      }
+    }, 3000);
+
     return () => {
+      mounted = false;
+      clearInterval(pollInterval);
       if (channel) {
+        console.log("Cleaning up realtime channel");
         supabase?.removeChannel(channel);
       }
     };
-  }, [code]);
+  }, [code, fetchPlayers, game?.id]);
 
   if (loading) {
     return (
@@ -156,11 +180,13 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
     );
   }
 
+  // Use database is_projector field to determine view
+  const isHost = currentPlayer?.is_projector === true;
   const regularPlayers = players.filter((p) => !p.is_projector);
-  const projector = players.find((p) => p.is_projector);
+  const host = players.find((p) => p.is_projector);
 
-  // PROJECTOR VIEW
-  if (isProjector) {
+  // HOST VIEW (Projector)
+  if (isHost) {
     return (
       <div className="min-h-screen bg-[#0a0a0f] text-white overflow-hidden relative">
         {/* Background effects */}
@@ -178,7 +204,11 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
               </span>
               <span className="text-white/90">CLASH</span>
             </h1>
-            <p className="text-zinc-500 text-lg">Waiting for players to join...</p>
+            <p className="text-zinc-500 text-lg">
+              {regularPlayers.length === 0 
+                ? "Waiting for players to join..." 
+                : `${regularPlayers.length} player${regularPlayers.length !== 1 ? 's' : ''} joined!`}
+            </p>
           </div>
 
           {/* Game Code Display */}
@@ -214,7 +244,7 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
                       <>
                         {/* Avatar */}
                         <div
-                          className="w-20 h-20 rounded-full flex items-center justify-center text-4xl font-bold mb-4 animate-bounce-in"
+                          className="w-20 h-20 rounded-full flex items-center justify-center text-4xl font-bold mb-4"
                           style={{ backgroundColor: player.avatar_color }}
                         >
                           {player.name.charAt(0).toUpperCase()}
@@ -238,13 +268,13 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
             </div>
           </div>
 
-          {/* Player Count */}
+          {/* Player Count & Start Button */}
           <div className="mt-12 text-center">
             <p className="text-2xl font-bold">
               <span className="text-violet-400">{regularPlayers.length}</span>
               <span className="text-zinc-600"> / 4 players</span>
             </p>
-            {regularPlayers.length >= 2 && (
+            {regularPlayers.length >= 1 && (
               <button className="mt-6 px-8 py-4 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-white rounded-2xl font-bold text-xl transition-all transform hover:scale-105">
                 Start Game →
               </button>
@@ -252,16 +282,16 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
           </div>
 
           {/* Host info */}
-          {projector && (
+          {host && (
             <div className="absolute bottom-8 left-8 flex items-center gap-3 text-zinc-500">
               <div
                 className="w-10 h-10 rounded-full flex items-center justify-center text-lg font-bold"
-                style={{ backgroundColor: projector.avatar_color }}
+                style={{ backgroundColor: host.avatar_color }}
               >
-                {projector.name.charAt(0).toUpperCase()}
+                {host.name.charAt(0).toUpperCase()}
               </div>
               <div>
-                <p className="text-white font-medium">{projector.name}</p>
+                <p className="text-white font-medium">{host.name}</p>
                 <p className="text-xs uppercase tracking-wider">Host</p>
               </div>
             </div>
@@ -314,12 +344,14 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
 
         {/* Other Players */}
         <div className="mt-12">
-          <p className="text-zinc-600 text-sm mb-4">Players joined</p>
-          <div className="flex justify-center gap-3">
+          <p className="text-zinc-600 text-sm mb-4">Players joined ({regularPlayers.length})</p>
+          <div className="flex justify-center gap-3 flex-wrap">
             {regularPlayers.map((p) => (
               <div
                 key={p.id}
-                className="w-12 h-12 rounded-full flex items-center justify-center text-lg font-bold"
+                className={`w-12 h-12 rounded-full flex items-center justify-center text-lg font-bold transition-all ${
+                  p.id === currentPlayer?.id ? "ring-2 ring-white ring-offset-2 ring-offset-[#0a0a0f]" : ""
+                }`}
                 style={{ backgroundColor: p.avatar_color }}
                 title={p.name}
               >
@@ -332,4 +364,3 @@ export default function GamePage({ params }: { params: Promise<{ code: string }>
     </div>
   );
 }
-

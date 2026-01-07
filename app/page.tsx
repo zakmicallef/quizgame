@@ -34,10 +34,9 @@ export default function Home() {
         return;
       }
 
-      // Store player info in localStorage
+      // Store player ID in localStorage (role is determined by database)
       localStorage.setItem("playerId", data.player.id);
       localStorage.setItem("playerName", data.player.name);
-      localStorage.setItem("isProjector", "true");
 
       router.push(`/game/${data.game.code}`);
     } catch {
@@ -74,9 +73,9 @@ export default function Home() {
         return;
       }
 
+      // Store player ID in localStorage (role is determined by database)
       localStorage.setItem("playerId", data.player.id);
       localStorage.setItem("playerName", data.player.name);
-      localStorage.setItem("isProjector", "false");
 
       router.push(`/game/${data.game.code}`);
     } catch {
